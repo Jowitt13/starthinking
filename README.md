@@ -77,11 +77,29 @@ npm.cmd start
 ## 当前能力
 
 - 直接读取 TXT / MD / CSV / JSON。
-- PDF / PNG / JPG / JPEG / WEBP 通过 Unlimited-OCR 识别。
+- PDF / PNG / JPG / JPEG / WEBP 会优先尝试 Unlimited-OCR。
+- Windows 原生环境下，Unlimited-OCR 的 SGLang kernel 当前没有 `win_amd64` wheel；软件会自动回退到本地 `qwen3.5:4b` 视觉 OCR。
 - 调用 Ollama `qwen3.5:4b` 生成单选题、填空题、简答题和闪卡。
 - Ollama 或 Unlimited-OCR 不可用时，文本资料会回退到本地启发式生成。
 - 按“忘记 / 模糊 / 记住 / 熟练”调整下次复习时间。
 - 可导出本地 JSON 备份。
+
+## OCR 环境状态
+
+已提供脚本：
+
+```powershell
+scripts\setup_unlimited_ocr.bat
+```
+
+它会：
+
+- 克隆 `baidu/Unlimited-OCR` 到 `third_party/Unlimited-OCR`
+- 创建 `.venv-ocr`
+- 安装 PDF 转图片和请求依赖
+- 尝试安装 Unlimited-OCR 的 SGLang wheel
+
+注意：官方 `infer.py` 走 SGLang。当前 Windows 原生环境会因为 `sglang-kernel` 缺少 Windows wheel 而无法完整安装 SGLang。要完整运行 Unlimited-OCR，建议后续使用 WSL2 Ubuntu 或 Linux/Docker 环境。当前软件已经做了可用后备：PDF 先转图片，再用本地 `qwen3.5:4b` 视觉能力提取文字。
 
 ## 模型选择
 

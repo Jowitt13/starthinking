@@ -7,3 +7,5 @@ dist/
 data/
 __pycache__/
 *.pyc
+.venv-ocr/
+third_party/

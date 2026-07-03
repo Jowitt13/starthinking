@@ -4,6 +4,8 @@ import queue
 import re
 import shutil
 import subprocess
+import sys
+import base64
 import tempfile
 import threading
 import time
@@ -153,8 +155,8 @@ def parse_json_from_text(text: str) -> dict:
 class Settings:
     ollama_url: str = "http://127.0.0.1:11434"
     ollama_model: str = "qwen3.5:4b"
-    python_path: str = "python"
-    unlimited_ocr_script: str = ""
+    python_path: str = sys.executable
+    unlimited_ocr_script: str = str(APP_DIR / "third_party" / "Unlimited-OCR" / "infer.py")
     ocr_concurrency: int = 2
     ocr_image_mode: str = "gundam"
     generation_count: int = 12
@@ -462,7 +464,11 @@ class StartThinkingApp:
     def extract_text(self, file_path: Path) -> str:
         if file_path.suffix.lower() in TEXT_EXTS:
             return file_path.read_text(encoding="utf-8", errors="ignore")
-        return self.run_unlimited_ocr(file_path)
+        try:
+            return self.run_unlimited_ocr(file_path)
+        except Exception as exc:
+            self.queue.put(("info", f"Unlimited-OCR 暂不可用，改用 qwen3.5:4b 视觉识别：{exc}"))
+            return self.run_ollama_vision_ocr(file_path)
 
     def run_unlimited_ocr(self, file_path: Path) -> str:
         settings = self.store.settings
@@ -486,6 +492,69 @@ class StartThinkingApp:
         if not text.strip():
             raise RuntimeError("Unlimited-OCR 没有输出可读取文本")
         return text
+
+    def run_ollama_vision_ocr(self, file_path: Path) -> str:
+        images = self.file_to_images(file_path)
+        parts = []
+        for index, image_path in enumerate(images):
+            self.queue.put(("info", f"正在用 qwen3.5:4b 识别第 {index + 1}/{len(images)} 页..."))
+            parts.append(self.ocr_image_with_ollama(image_path, index + 1))
+        text = "\n\n".join(part for part in parts if part.strip())
+        if not text.strip():
+            raise RuntimeError("qwen3.5:4b 视觉识别没有返回文本")
+        return text
+
+    def file_to_images(self, file_path: Path) -> list[Path]:
+        suffix = file_path.suffix.lower()
+        if suffix in IMAGE_EXTS:
+            return [file_path]
+        if suffix != ".pdf":
+            raise RuntimeError(f"{file_path.name} 不是支持的 OCR 文件类型")
+        try:
+            import fitz
+        except ImportError as exc:
+            raise RuntimeError("PDF 识别需要 PyMuPDF，请先运行 scripts\\setup_unlimited_ocr.bat") from exc
+        output_dir = Path(tempfile.mkdtemp(prefix="startthinking-pdf-"))
+        doc = fitz.open(file_path)
+        image_paths = []
+        mat = fitz.Matrix(160 / 72, 160 / 72)
+        for page_index, page in enumerate(doc):
+            image_path = output_dir / f"page_{page_index + 1:04d}.png"
+            page.get_pixmap(matrix=mat).save(image_path)
+            image_paths.append(image_path)
+        doc.close()
+        return image_paths
+
+    def ocr_image_with_ollama(self, image_path: Path, page_number: int) -> str:
+        encoded = base64.b64encode(image_path.read_bytes()).decode("utf-8")
+        payload = {
+            "model": self.store.settings.ollama_model,
+            "stream": False,
+            "think": False,
+            "messages": [
+                {
+                    "role": "user",
+                    "content": (
+                        "请对这张学习资料图片做 OCR。只输出可复制的正文文本。"
+                        "保留标题、段落、列表、公式和表格中的关键信息。"
+                        "不要解释，不要总结，不要添加资料中没有的内容。"
+                        f"这是第 {page_number} 页。"
+                    ),
+                    "images": [encoded],
+                }
+            ],
+            "options": {"temperature": 0, "num_predict": 4096},
+        }
+        req = urllib.request.Request(
+            self.store.settings.ollama_url.rstrip("/") + "/api/chat",
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=180) as response:
+            raw = json.loads(response.read().decode("utf-8"))
+        message = raw.get("message", {})
+        return message.get("content", "") or message.get("thinking", "")
 
     def collect_text(self, directory: Path) -> str:
         parts = []
@@ -512,11 +581,12 @@ class StartThinkingApp:
             payload = {
                 "model": settings.ollama_model,
                 "stream": False,
+                "think": False,
                 "messages": [
                     {"role": "system", "content": "你只输出严格 JSON。"},
                     {"role": "user", "content": self.build_prompt(title, text)},
                 ],
-                "options": {"temperature": 0.2},
+                "options": {"temperature": 0.2, "num_predict": 8192},
             }
             req = urllib.request.Request(
                 settings.ollama_url.rstrip("/") + "/api/chat",
@@ -526,7 +596,8 @@ class StartThinkingApp:
             )
             with urllib.request.urlopen(req, timeout=180) as response:
                 raw = json.loads(response.read().decode("utf-8"))
-            content = raw.get("message", {}).get("content", "")
+            message = raw.get("message", {})
+            content = message.get("content", "") or message.get("thinking", "")
             return normalize_generated(parse_json_from_text(content), title, text, source)
         except Exception as exc:
             self.queue.put(("info", f"Ollama 不可用，已回退本地规则：{exc}"))

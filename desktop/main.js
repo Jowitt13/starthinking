@@ -288,18 +288,19 @@ ${text.slice(0, 24000)}`;
     body: JSON.stringify({
       model,
       stream: false,
+      think: false,
       messages: [
         { role: "system", content: "你只输出严格 JSON。" },
         { role: "user", content: prompt },
       ],
-      options: { temperature: 0.2 },
+      options: { temperature: 0.2, num_predict: 8192 },
     }),
     signal: AbortSignal.timeout(180000),
   });
 
   if (!response.ok) throw new Error(`Ollama 返回 ${response.status}`);
   const data = await response.json();
-  const content = data?.message?.content || "";
+  const content = data?.message?.content || data?.message?.thinking || "";
   return normalizeGeneratedJson(parseJsonFromText(content), title);
 }
 
