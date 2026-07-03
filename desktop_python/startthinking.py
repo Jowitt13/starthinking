@@ -1,21 +1,19 @@
+import base64
 import json
-import os
 import queue
 import re
 import shutil
 import subprocess
 import sys
-import base64
 import tempfile
 import threading
 import time
-import urllib.error
 import urllib.request
 import uuid
 from dataclasses import dataclass, field
 from pathlib import Path
-from tkinter import BooleanVar, END, StringVar, Tk, filedialog, messagebox
-from tkinter import ttk
+import tkinter as tk
+from tkinter import filedialog, messagebox
 
 
 APP_DIR = Path(__file__).resolve().parents[1]
@@ -32,6 +30,30 @@ SAMPLE_TEXT = """机器学习是一种让计算机从数据中学习规律的方
 混淆矩阵用于评估分类模型，包含真正例、假正例、真反例和假反例。准确率、精确率、召回率和 F1 值都可以从中计算。"""
 
 
+COLORS = {
+    "app": "#eef3fb",
+    "shell": "#ffffff",
+    "sidebar": "#fbfcff",
+    "panel": "#ffffff",
+    "panel_soft": "#f7f9fe",
+    "line": "#dfe6f1",
+    "line_soft": "#edf1f7",
+    "text": "#152033",
+    "muted": "#717b8c",
+    "blue": "#2f66f6",
+    "blue_dark": "#1f55e6",
+    "blue_soft": "#eaf1ff",
+    "green": "#38b979",
+    "green_soft": "#e8f7ef",
+    "orange": "#ec7d2b",
+    "orange_soft": "#fff0e7",
+    "red": "#e95050",
+    "red_soft": "#fff0f0",
+    "cyan": "#46c4d1",
+    "cyan_soft": "#e9fbfc",
+}
+
+
 def now_ms() -> int:
     return int(time.time() * 1000)
 
@@ -40,8 +62,15 @@ def new_id(prefix: str) -> str:
     return f"{prefix}-{uuid.uuid4().hex[:10]}"
 
 
+def safe_int(value, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
 def split_material(text: str) -> list[str]:
-    normalized = re.sub(r"[ \t]+", " ", text.replace("\r", "\n")).strip()
+    normalized = re.sub(r"[ \t]+", " ", str(text or "").replace("\r", "\n")).strip()
     parts = re.split(r"\n+|(?<=[。！？.!?])\s+", normalized)
     usable = [part.strip() for part in parts if len(part.strip()) > 18]
     return usable or ([normalized] if normalized else [])
@@ -67,12 +96,25 @@ def guess_title(text: str) -> str:
     return (parts[0] if parts else "新复习资料")[:22].rstrip("。！？,.!?")
 
 
+def parse_json_from_text(text: str) -> dict:
+    text = (text or "").strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{[\s\S]*\}", text)
+        if not match:
+            raise
+        return json.loads(match.group(0))
+
+
 def local_generate(title: str, text: str, source: str, count: int) -> dict:
-    paragraphs = split_material(text)[: max(4, min(30, count))]
+    source_parts = split_material(text) or [text.strip() or title]
+    target_count = max(4, min(40, count))
+    paragraphs = [source_parts[index % len(source_parts)] for index in range(target_count)]
     keywords = [extract_keyword(p, i) for i, p in enumerate(paragraphs)]
+    defaults = ["正则化", "混淆矩阵", "梯度下降", "监督学习", "特征缩放", "交叉验证", "召回率"]
     questions = []
     cards = []
-    defaults = ["正则化", "混淆矩阵", "梯度下降", "监督学习", "特征缩放", "交叉验证", "召回率"]
 
     for index, paragraph in enumerate(paragraphs):
         keyword = keywords[index]
@@ -98,7 +140,7 @@ def local_generate(title: str, text: str, source: str, count: int) -> dict:
                 }
             )
         else:
-            distractors = [x for x in [*keywords, *defaults] if x != keyword][:3]
+            distractors = [item for item in [*keywords, *defaults] if item != keyword][:3]
             questions.append(
                 {
                     "type": "single",
@@ -124,33 +166,6 @@ def local_generate(title: str, text: str, source: str, count: int) -> dict:
     return {"title": title, "source": source, "text": text, "questions": questions, "cards": cards}
 
 
-def normalize_generated(data: dict, title: str, text: str, source: str) -> dict:
-    if not isinstance(data, dict):
-        raise ValueError("模型返回内容不是 JSON 对象")
-    questions = data.get("questions") or []
-    cards = data.get("cards") or []
-    if not isinstance(questions, list) or not isinstance(cards, list):
-        raise ValueError("模型 JSON 缺少 questions/cards 数组")
-    return {
-        "title": data.get("title") or title,
-        "source": source,
-        "text": text,
-        "questions": questions[:40],
-        "cards": cards[:40],
-    }
-
-
-def parse_json_from_text(text: str) -> dict:
-    text = text.strip()
-    try:
-        return json.loads(text)
-    except json.JSONDecodeError:
-        match = re.search(r"\{[\s\S]*\}", text)
-        if not match:
-            raise
-        return json.loads(match.group(0))
-
-
 @dataclass
 class Settings:
     ollama_url: str = "http://127.0.0.1:11434"
@@ -159,7 +174,9 @@ class Settings:
     unlimited_ocr_script: str = str(APP_DIR / "third_party" / "Unlimited-OCR" / "infer.py")
     ocr_concurrency: int = 2
     ocr_image_mode: str = "gundam"
-    generation_count: int = 12
+    generation_count: int = 20
+    question_type: str = "选择题"
+    difficulty: str = "基础"
 
 
 @dataclass
@@ -170,15 +187,21 @@ class Store:
 
     @classmethod
     def load(cls) -> "Store":
-      DATA_DIR.mkdir(exist_ok=True)
-      if not DATA_FILE.exists():
-          store = cls()
-          store.add_set(local_generate("机器学习：监督学习笔记", SAMPLE_TEXT, "示例资料", 12))
-          store.save()
-          return store
-      raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
-      settings = Settings(**{**Settings().__dict__, **raw.get("settings", {})})
-      return cls(settings=settings, sets=raw.get("sets", []), review_log=raw.get("review_log", []))
+        DATA_DIR.mkdir(exist_ok=True)
+        if not DATA_FILE.exists():
+            store = cls()
+            store.add_set(local_generate("机器学习：监督学习笔记", SAMPLE_TEXT, "示例资料", 12))
+            store.save()
+            return store
+        try:
+            raw = json.loads(DATA_FILE.read_text(encoding="utf-8"))
+            settings = Settings(**{**Settings().__dict__, **raw.get("settings", {})})
+            return cls(settings=settings, sets=raw.get("sets", []), review_log=raw.get("review_log", []))
+        except Exception:
+            backup = DATA_FILE.with_suffix(f".broken-{int(time.time())}.json")
+            shutil.copy2(DATA_FILE, backup)
+            DATA_FILE.unlink(missing_ok=True)
+            return cls.load()
 
     def save(self) -> None:
         DATA_DIR.mkdir(exist_ok=True)
@@ -191,7 +214,7 @@ class Store:
             encoding="utf-8",
         )
 
-    def add_set(self, generated: dict) -> None:
+    def add_set(self, generated: dict, status: str = "已解析") -> dict:
         set_id = new_id("set")
         created_at = int(time.time())
         items = []
@@ -206,25 +229,24 @@ class Store:
                 "topic": card.get("topic") or card.get("front") or "知识点",
             }
             items.append(make_item(set_id, question, generated.get("source", "资料"), index, is_card=True))
-        self.sets.insert(
-            0,
-            {
-                "id": set_id,
-                "title": generated.get("title", "新学习集"),
-                "source": generated.get("source", "资料"),
-                "text": generated.get("text", ""),
-                "created_at": created_at,
-                "items": items,
-            },
-        )
+        study_set = {
+            "id": set_id,
+            "title": generated.get("title", "新学习集"),
+            "source": generated.get("source", "资料"),
+            "text": generated.get("text", ""),
+            "created_at": created_at,
+            "status": status,
+            "items": items,
+        }
+        self.sets.insert(0, study_set)
         self.save()
+        return study_set
 
     def all_items(self) -> list[dict]:
         return [item for study_set in self.sets for item in study_set.get("items", [])]
 
     def due_items(self) -> list[dict]:
-        now = now_ms()
-        return sorted([item for item in self.all_items() if item.get("due_at", 0) <= now], key=lambda item: item.get("due_at", 0))
+        return sorted([item for item in self.all_items() if item.get("due_at", 0) <= now_ms()], key=lambda item: item.get("due_at", 0))
 
 
 def make_item(set_id: str, question: dict, source: str, index: int, is_card: bool) -> dict:
@@ -246,205 +268,304 @@ def make_item(set_id: str, question: dict, source: str, index: int, is_card: boo
     }
 
 
+class RoundedCanvas(tk.Canvas):
+    def round_rect(self, x1, y1, x2, y2, radius=14, **kwargs):
+        points = [
+            x1 + radius,
+            y1,
+            x2 - radius,
+            y1,
+            x2,
+            y1,
+            x2,
+            y1 + radius,
+            x2,
+            y2 - radius,
+            x2,
+            y2,
+            x2 - radius,
+            y2,
+            x1 + radius,
+            y2,
+            x1,
+            y2,
+            x1,
+            y2 - radius,
+            x1,
+            y1 + radius,
+            x1,
+            y1,
+        ]
+        return self.create_polygon(points, smooth=True, **kwargs)
+
+
 class StartThinkingApp:
-    def __init__(self, root: Tk):
+    def __init__(self, root: tk.Tk):
         self.root = root
         self.store = Store.load()
         self.queue: queue.Queue = queue.Queue()
-        self.current_item_id: str | None = None
-        self.status = StringVar(value="就绪")
+        self.current_item_id = None
+        self.active_nav = "home"
+        self.busy = False
+        self.uploaded_files: list[Path] = []
+        self.status_text = "就绪"
 
-        self.root.title("StartThinking - 本地 AI 复习软件")
-        self.root.geometry("1120x760")
-        self.root.minsize(980, 680)
+        self.question_type = tk.StringVar(value=self.store.settings.question_type)
+        self.difficulty = tk.StringVar(value=self.store.settings.difficulty)
+        self.question_count = tk.IntVar(value=self.store.settings.generation_count)
+        self.search_text = tk.StringVar(value="")
 
-        self.build_ui()
-        self.refresh_all()
+        self.root.title("AI 出题助手")
+        self.root.geometry("1440x820")
+        self.root.minsize(1180, 720)
+        self.root.configure(bg=COLORS["app"])
+
+        self.canvas = RoundedCanvas(root, bg=COLORS["app"], highlightthickness=0)
+        self.canvas.pack(fill="both", expand=True)
+        self.canvas.bind("<Configure>", lambda _event: self.render())
         self.root.after(200, self.consume_queue)
 
-    def build_ui(self) -> None:
-        self.notebook = ttk.Notebook(self.root)
-        self.notebook.pack(fill="both", expand=True)
+    def render(self):
+        self.canvas.delete("all")
+        w = max(self.canvas.winfo_width(), 1180)
+        h = max(self.canvas.winfo_height(), 720)
+        margin = 28
+        shell = (margin, 18, w - margin, h - 20)
+        side_w = 208
+        top_h = 74
+        right_w = 520
 
-        self.import_tab = ttk.Frame(self.notebook, padding=16)
-        self.review_tab = ttk.Frame(self.notebook, padding=16)
-        self.library_tab = ttk.Frame(self.notebook, padding=16)
-        self.settings_tab = ttk.Frame(self.notebook, padding=16)
+        self.canvas.round_rect(*shell, radius=24, fill=COLORS["shell"], outline="#e8edf5")
+        self.canvas.create_line(shell[0] + side_w, shell[1] + top_h, shell[0] + side_w, shell[3], fill=COLORS["line"])
+        self.canvas.create_line(shell[0], shell[1] + top_h, shell[2], shell[1] + top_h, fill=COLORS["line"])
+        self.canvas.create_line(shell[2] - right_w, shell[1] + top_h, shell[2] - right_w, shell[3], fill=COLORS["line"])
 
-        self.notebook.add(self.import_tab, text="导入 / 生成")
-        self.notebook.add(self.review_tab, text="复习")
-        self.notebook.add(self.library_tab, text="资料库")
-        self.notebook.add(self.settings_tab, text="设置")
+        self.draw_sidebar(shell[0], shell[1], side_w, shell[3] - shell[1])
+        self.draw_topbar(shell[0] + side_w, shell[1], shell[2] - shell[0] - side_w, top_h)
 
-        self.build_import_tab()
-        self.build_review_tab()
-        self.build_library_tab()
-        self.build_settings_tab()
+        content_x = shell[0] + side_w + 30
+        content_y = shell[1] + top_h + 26
+        center_w = shell[2] - right_w - content_x - 28
+        right_x = shell[2] - right_w + 30
+        right_y = content_y
+        right_inner_w = right_w - 58
 
-        status_bar = ttk.Label(self.root, textvariable=self.status, padding=(10, 5))
-        status_bar.pack(fill="x")
+        self.draw_upload_section(content_x, content_y, center_w)
+        self.draw_config_section(content_x, content_y + 270, center_w)
+        self.draw_recent_section(content_x, content_y + 500, center_w)
+        self.draw_preview_section(right_x, right_y, right_inner_w, shell[3] - right_y - 20)
 
-    def build_import_tab(self) -> None:
-        top = ttk.Frame(self.import_tab)
-        top.pack(fill="x")
-        ttk.Button(top, text="选择文件并识别", command=self.choose_files).pack(side="left")
-        ttk.Button(top, text="用粘贴文本生成", command=self.generate_from_text).pack(side="left", padx=8)
-        ttk.Button(top, text="填入示例", command=self.fill_sample).pack(side="left")
+    def text(self, x, y, value, size=12, fill=None, weight="normal", anchor="nw", width=None):
+        font = ("Microsoft YaHei UI", size, weight)
+        return self.canvas.create_text(x, y, text=value, fill=fill or COLORS["text"], font=font, anchor=anchor, width=width)
 
-        self.text_input = ttk.Frame(self.import_tab)
-        self.text_input.pack(fill="both", expand=True, pady=12)
-        self.material_text = TextWithScrollbar(self.text_input)
-        self.material_text.pack(fill="both", expand=True)
-        self.material_text.set(SAMPLE_TEXT)
+    def draw_button(self, x, y, w, h, text, fill, fg, command=None, outline=None, radius=8, tag=None):
+        tag = tag or f"btn-{new_id('ui')}"
+        self.canvas.round_rect(x, y, x + w, y + h, radius=radius, fill=fill, outline=outline or fill, tags=(tag,))
+        label_id = self.text(x + w / 2, y + h / 2, text, size=12, fill=fg, weight="bold", anchor="center")
+        if command:
+            for target in (tag, label_id):
+                self.canvas.tag_bind(target, "<Button-1>", lambda _event: command())
+                self.canvas.tag_bind(target, "<Enter>", lambda _event: self.canvas.configure(cursor="hand2"))
+                self.canvas.tag_bind(target, "<Leave>", lambda _event: self.canvas.configure(cursor=""))
 
-        note = "PDF/图片会调用 Unlimited-OCR；TXT/MD/CSV/JSON 直接读取；出题使用 Ollama qwen3.5:4b。"
-        ttk.Label(self.import_tab, text=note).pack(anchor="w")
+    def draw_sidebar(self, x, y, w, h):
+        self.canvas.round_rect(x, y, x + w, y + h, radius=24, fill=COLORS["sidebar"], outline="")
+        self.canvas.round_rect(x + 38, y + 28, x + 68, y + 58, radius=8, fill=COLORS["blue"], outline="")
+        self.text(x + 53, y + 43, "A", size=16, fill="white", weight="bold", anchor="center")
+        self.text(x + 88, y + 34, "AI 出题助手", size=17, weight="bold")
 
-    def build_review_tab(self) -> None:
-        header = ttk.Frame(self.review_tab)
-        header.pack(fill="x")
-        ttk.Label(header, text="今日复习队列").pack(side="left")
-        ttk.Button(header, text="刷新", command=self.refresh_review).pack(side="right")
+        nav = [("home", "⌂", "首页"), ("library", "□", "资料库"), ("generate", "✦", "智能出题"), ("manage", "▤", "题目管理"), ("record", "⌁", "学习记录"), ("settings", "⚙", "设置")]
+        for i, (key, icon, label) in enumerate(nav):
+            yy = y + 110 + i * 56
+            active = key == self.active_nav
+            if active:
+                self.canvas.round_rect(x + 22, yy - 10, x + w - 22, yy + 34, radius=8, fill=COLORS["blue_soft"], outline="")
+            self.text(x + 44, yy + 2, icon, size=17, fill=COLORS["blue"] if active else "#526071", weight="bold")
+            self.text(x + 78, yy + 2, label, size=13, fill=COLORS["blue"] if active else "#526071", weight="bold" if active else "normal")
 
-        self.review_list = ttk.Treeview(self.review_tab, columns=("topic", "difficulty", "source"), show="headings", height=8)
-        self.review_list.heading("topic", text="知识点")
-        self.review_list.heading("difficulty", text="难度")
-        self.review_list.heading("source", text="来源")
-        self.review_list.pack(fill="x", pady=8)
-        self.review_list.bind("<<TreeviewSelect>>", self.select_review_item)
+        box_y = y + h - 170
+        self.canvas.round_rect(x + 22, box_y, x + w - 22, box_y + 120, radius=10, fill="#ffffff", outline=COLORS["line"])
+        self.text(x + 38, box_y + 18, "AI 生成额度", size=11, fill=COLORS["muted"])
+        self.text(x + 38, box_y + 46, "2,450", size=18, weight="bold")
+        self.text(x + 92, box_y + 50, "/ 5,000", size=11, fill=COLORS["muted"])
+        self.canvas.create_line(x + 38, box_y + 78, x + w - 58, box_y + 78, fill="#e3e8f1", width=4)
+        self.canvas.create_line(x + 38, box_y + 78, x + 118, box_y + 78, fill=COLORS["blue"], width=4)
+        self.text(x + 38, box_y + 96, "本地模型可用", size=11, fill=COLORS["blue"])
 
-        self.question_text = TextWithScrollbar(self.review_tab, height=8)
-        self.question_text.pack(fill="both", expand=True, pady=8)
+    def draw_topbar(self, x, y, w, h):
+        search_w = 430
+        sx = x + (w - search_w) / 2 - 90
+        self.canvas.round_rect(sx, y + 20, sx + search_w, y + 56, radius=10, fill=COLORS["panel_soft"], outline=COLORS["line"])
+        self.text(sx + 20, y + 38, "⌕", size=14, fill=COLORS["muted"], anchor="center")
+        self.text(sx + 42, y + 30, "搜索资料、题目或知识点", size=11, fill=COLORS["muted"])
+        self.canvas.round_rect(sx + search_w - 42, y + 26, sx + search_w - 12, y + 50, radius=6, fill="#ffffff", outline=COLORS["line"])
+        self.text(sx + search_w - 27, y + 38, "⌘ K", size=9, fill=COLORS["muted"], anchor="center")
+        self.text(x + w - 180, y + 37, "🔔", size=16, anchor="center")
+        self.canvas.create_oval(x + w - 164, y + 23, x + w - 158, y + 29, fill=COLORS["red"], outline="")
+        self.canvas.create_oval(x + w - 120, y + 24, x + w - 92, y + 52, fill="#dbe6f5", outline="")
+        self.text(x + w - 106, y + 38, "我", size=10, anchor="center", weight="bold")
+        self.text(x + w - 80, y + 31, "张同学⌄", size=12, weight="bold")
+        status_fill = COLORS["blue_soft"] if self.busy else "#f5f7fb"
+        status_fg = COLORS["blue"] if self.busy else COLORS["muted"]
+        self.canvas.round_rect(x + 28, y + 22, x + 250, y + 54, radius=8, fill=status_fill, outline=COLORS["line"])
+        self.text(x + 44, y + 38, "●", size=10, fill=status_fg, anchor="center")
+        self.text(x + 62, y + 30, self.status_text[:22], size=11, fill=status_fg, weight="bold" if self.busy else "normal")
 
-        actions = ttk.Frame(self.review_tab)
-        actions.pack(fill="x")
-        ttk.Button(actions, text="显示答案", command=self.show_answer).pack(side="left")
-        for label, grade in [("忘记", 1), ("模糊", 2), ("记住", 3), ("熟练", 4)]:
-            ttk.Button(actions, text=label, command=lambda g=grade: self.grade_current(g)).pack(side="left", padx=4)
+    def draw_upload_section(self, x, y, w):
+        self.text(x, y, "1. 上传学习资料", size=14, weight="bold")
+        self.text(x + 116, y + 2, "ⓘ", size=11, fill=COLORS["muted"])
+        uy = y + 32
+        self.canvas.round_rect(x, uy, x + w, uy + 210, radius=10, fill="#fbfdff", outline="#b7cdfd", dash=(3, 2))
+        self.text(x + w / 2, uy + 54, "☁", size=40, fill="#6f96f7", anchor="center")
+        self.text(x + w / 2, uy + 92, "拖拽文件到此处，或点击上传", size=14, weight="bold", anchor="center")
+        self.text(x + w / 2, uy + 120, "支持 PDF、DOCX、PPT、TXT 格式，单个文件不超过 100MB", size=11, fill=COLORS["muted"], anchor="center")
+        self.draw_button(x + w / 2 - 72, uy + 148, 144, 34, "↥  选择文件", COLORS["blue"], "white", self.choose_files)
+        labels = [("PDF", COLORS["red_soft"], COLORS["red"]), ("DOCX", COLORS["blue_soft"], COLORS["blue"]), ("PPT", COLORS["orange_soft"], COLORS["orange"]), ("TXT", "#f6f8fb", "#526071")]
+        start = x + w / 2 - 204
+        for i, (label, bg, fg) in enumerate(labels):
+            self.canvas.round_rect(start + i * 98, uy + 188, start + i * 98 + 84, uy + 214, radius=6, fill=bg, outline=COLORS["line"])
+            self.text(start + i * 98 + 42, uy + 201, label, size=10, fill=fg, anchor="center", weight="bold")
 
-    def build_library_tab(self) -> None:
-        self.library = ttk.Treeview(self.library_tab, columns=("count", "source", "created"), show="headings")
-        self.library.heading("count", text="题卡数")
-        self.library.heading("source", text="来源")
-        self.library.heading("created", text="创建时间")
-        self.library.pack(fill="both", expand=True)
-        ttk.Button(self.library_tab, text="导出备份 JSON", command=self.export_backup).pack(anchor="e", pady=8)
+    def draw_config_section(self, x, y, w):
+        self.text(x, y, "2. 出题配置", size=14, weight="bold")
+        rows = [("题目类型", ["选择题", "填空题", "判断题"], self.question_type), ("难度等级", ["基础", "进阶", "综合"], self.difficulty)]
+        for row_index, (label, values, var) in enumerate(rows):
+            yy = y + 44 + row_index * 48
+            self.text(x, yy + 8, label, size=11, fill="#475266")
+            for i, value in enumerate(values):
+                bx = x + 120 + i * 140
+                active = var.get() == value
+                tag = f"choice-{row_index}-{i}"
+                self.canvas.round_rect(
+                    bx,
+                    yy,
+                    bx + 122,
+                    yy + 32,
+                    radius=6,
+                    fill=COLORS["blue_soft"] if active else "#ffffff",
+                    outline="#b9cdf8" if active else COLORS["line"],
+                    tags=(tag,),
+                )
+                label_id = self.text(
+                    bx + 61,
+                    yy + 16,
+                    ("●  " if active else "○  ") + value,
+                    size=11,
+                    fill=COLORS["blue"] if active else "#526071",
+                    weight="bold" if active else "normal",
+                    anchor="center",
+                )
+                for target in (tag, label_id):
+                    self.canvas.tag_bind(target, "<Button-1>", lambda _e, v=value, variable=var: self.set_choice(variable, v))
+                    self.canvas.tag_bind(target, "<Enter>", lambda _e: self.canvas.configure(cursor="hand2"))
+                    self.canvas.tag_bind(target, "<Leave>", lambda _e: self.canvas.configure(cursor=""))
 
-    def build_settings_tab(self) -> None:
-        self.vars = {
-            "ollama_url": StringVar(value=self.store.settings.ollama_url),
-            "ollama_model": StringVar(value=self.store.settings.ollama_model),
-            "python_path": StringVar(value=self.store.settings.python_path),
-            "unlimited_ocr_script": StringVar(value=self.store.settings.unlimited_ocr_script),
-            "ocr_concurrency": StringVar(value=str(self.store.settings.ocr_concurrency)),
-            "ocr_image_mode": StringVar(value=self.store.settings.ocr_image_mode),
-            "generation_count": StringVar(value=str(self.store.settings.generation_count)),
-        }
-        labels = {
-            "ollama_url": "Ollama 地址",
-            "ollama_model": "本地模型",
-            "python_path": "Python 路径",
-            "unlimited_ocr_script": "Unlimited-OCR infer.py",
-            "ocr_concurrency": "OCR 并发",
-            "ocr_image_mode": "OCR 图像模式",
-            "generation_count": "生成数量",
-        }
-        for key, label in labels.items():
-            row = ttk.Frame(self.settings_tab)
-            row.pack(fill="x", pady=5)
-            ttk.Label(row, text=label, width=24).pack(side="left")
-            ttk.Entry(row, textvariable=self.vars[key]).pack(side="left", fill="x", expand=True)
-            if key == "unlimited_ocr_script":
-                ttk.Button(row, text="浏览", command=self.pick_ocr_script).pack(side="left", padx=6)
+        yy = y + 145
+        self.text(x, yy + 8, "题目数量", size=11, fill="#475266")
+        self.canvas.create_line(x + 120, yy + 16, x + 520, yy + 16, fill="#d8e0ec", width=4)
+        count = self.question_count.get()
+        ratio = (count - 5) / 45
+        px = x + 120 + max(0, min(1, ratio)) * 400
+        self.canvas.create_line(x + 120, yy + 16, px, yy + 16, fill=COLORS["blue"], width=4)
+        self.canvas.create_oval(px - 7, yy + 9, px + 7, yy + 23, fill="white", outline=COLORS["blue"], width=3)
+        for value in [5, 10, 20, 30, 50]:
+            vx = x + 120 + (value - 5) / 45 * 400
+            self.text(vx, yy + 30, str(value), size=10, fill=COLORS["muted"], anchor="center")
+        self.canvas.round_rect(x + 550, yy, x + 594, yy + 32, radius=6, fill=COLORS["blue_soft"], outline="")
+        self.text(x + 572, yy + 16, str(count), size=11, fill=COLORS["blue"], weight="bold", anchor="center")
+        self.text(x + 608, yy + 9, "题", size=11, fill=COLORS["text"])
 
-        actions = ttk.Frame(self.settings_tab)
-        actions.pack(fill="x", pady=12)
-        ttk.Button(actions, text="保存设置", command=self.save_settings).pack(side="left")
-        ttk.Button(actions, text="检测服务", command=self.check_services).pack(side="left", padx=8)
-        ttk.Button(actions, text="拉取 Qwen3.5-4B", command=self.pull_qwen).pack(side="left")
+        self.draw_button(x + w / 2 - 86, y + 190, 172, 36, "✦  开始生成", COLORS["blue"], "white", self.generate_from_current_files)
+        self.text(x + w / 2, y + 232, "预计需要 10–60 秒，PDF 首次识别会更久", size=10, fill=COLORS["muted"], anchor="center")
 
-        self.service_text = TextWithScrollbar(self.settings_tab, height=10)
-        self.service_text.pack(fill="both", expand=True)
+    def draw_recent_section(self, x, y, w):
+        self.text(x, y, "3. 最近资料", size=14, weight="bold")
+        self.canvas.round_rect(x, y + 30, x + w, y + 180, radius=10, fill="#ffffff", outline=COLORS["line"])
+        headers = [("文件名", x + 18), ("类型", x + w - 360), ("大小", x + w - 270), ("上传时间", x + w - 185), ("状态", x + w - 72)]
+        for label, hx in headers:
+            self.text(hx, y + 48, label, size=10, fill=COLORS["muted"])
+        recent = self.store.sets[:3]
+        if not recent:
+            self.text(x + w / 2, y + 105, "暂无资料，上传 PDF 后会自动识别并生成题目", size=12, fill=COLORS["muted"], anchor="center")
+        for i, study_set in enumerate(recent):
+            yy = y + 76 + i * 34
+            self.canvas.create_line(x + 16, yy - 8, x + w - 16, yy - 8, fill=COLORS["line_soft"])
+            ext = Path(study_set.get("source", "")).suffix.replace(".", "").upper() or "TXT"
+            color = COLORS["red"] if ext == "PDF" else COLORS["orange"] if ext in {"PPT", "PPTX"} else COLORS["blue"]
+            self.text(x + 18, yy, "▣", size=12, fill=color)
+            self.text(x + 42, yy, study_set.get("title", "学习资料")[:26], size=11, weight="bold")
+            self.text(x + w - 360, yy, ext[:5], size=10, fill="#526071")
+            self.text(x + w - 270, yy, f"{len(study_set.get('text', '')) / 1024:.1f} KB", size=10, fill="#526071")
+            created = time.strftime("%m-%d %H:%M", time.localtime(study_set.get("created_at", 0)))
+            self.text(x + w - 185, yy, created, size=10, fill="#526071")
+            status = study_set.get("status", "已解析")
+            pill_bg = COLORS["green_soft"] if "失败" not in status else COLORS["red_soft"]
+            pill_fg = COLORS["green"] if "失败" not in status else COLORS["red"]
+            self.canvas.round_rect(x + w - 82, yy - 4, x + w - 24, yy + 20, radius=6, fill=pill_bg, outline="")
+            self.text(x + w - 53, yy + 8, status[:4], size=9, fill=pill_fg, anchor="center", weight="bold")
+        self.text(x + w / 2, y + 160, "查看全部资料  ›", size=11, fill=COLORS["blue"], anchor="center")
 
-    def refresh_all(self) -> None:
-        self.refresh_review()
-        self.refresh_library()
+    def draw_preview_section(self, x, y, w, h):
+        self.text(x, y, "4. 题目预览", size=14, weight="bold")
+        self.text(x + 110, y + 1, "✦", size=14, fill=COLORS["blue"])
+        self.draw_button(x + w - 80, y - 4, 72, 32, "查看全部", "#ffffff", "#526071", None, outline=COLORS["line"])
+        items = self.store.all_items()[:6]
+        if not items:
+            self.draw_empty_preview(x, y + 48, w)
+            return
+        card_y = y + 48
+        for index, item in enumerate(items[:2]):
+            height = 260 if index == 0 else 220
+            self.draw_question_card(x, card_y, w, height, item, index + 1)
+            card_y += height + 16
+        self.text(x + 6, min(y + h - 20, card_y + 8), "ⓘ  以上为 AI 生成示例，内容仅供参考，请结合实际情况使用。", size=10, fill=COLORS["muted"])
 
-    def refresh_review(self) -> None:
-        for item in self.review_list.get_children():
-            self.review_list.delete(item)
-        for item in self.store.due_items():
-            self.review_list.insert("", END, iid=item["id"], values=(item["topic"], item["difficulty"], item["source"]))
-        due = self.store.due_items()
-        if due:
-            self.current_item_id = due[0]["id"]
-            self.render_question(due[0], show_answer=False)
+    def draw_empty_preview(self, x, y, w):
+        self.canvas.round_rect(x, y, x + w, y + 220, radius=10, fill="#ffffff", outline=COLORS["line"])
+        self.text(x + w / 2, y + 86, "上传 PDF 后会自动生成题目预览", size=13, fill=COLORS["muted"], anchor="center")
+        self.draw_button(x + w / 2 - 70, y + 124, 140, 34, "选择文件", COLORS["blue"], "white", self.choose_files)
+
+    def draw_question_card(self, x, y, w, h, item, index):
+        self.canvas.round_rect(x, y, x + w, y + h, radius=10, fill="#ffffff", outline=COLORS["line"])
+        type_label = {"single": "选择题", "cloze": "填空题", "short": "简答题", "card": "闪卡"}.get(item.get("type"), "题目")
+        type_bg = COLORS["blue_soft"] if type_label == "选择题" else COLORS["cyan_soft"] if type_label == "填空题" else COLORS["orange_soft"]
+        type_fg = COLORS["blue"] if type_label == "选择题" else COLORS["cyan"] if type_label == "填空题" else COLORS["orange"]
+        self.canvas.round_rect(x + 20, y + 18, x + 78, y + 46, radius=6, fill=type_bg, outline="")
+        self.text(x + 49, y + 32, type_label, size=10, fill=type_fg, weight="bold", anchor="center")
+        diff = "基础" if item.get("difficulty") == "简单" else "进阶" if item.get("difficulty") == "中等" else "综合"
+        diff_bg = COLORS["green_soft"] if diff == "基础" else COLORS["orange_soft"]
+        diff_fg = COLORS["green"] if diff == "基础" else COLORS["orange"]
+        self.canvas.round_rect(x + w - 70, y + 18, x + w - 22, y + 46, radius=6, fill=diff_bg, outline="")
+        self.text(x + w - 46, y + 32, diff, size=10, fill=diff_fg, weight="bold", anchor="center")
+        prompt = f"{index}. {item.get('prompt', '')}"
+        self.text(x + 20, y + 74, prompt, size=12, weight="bold", width=w - 54)
+        yy = y + 116
+        options = item.get("options") or []
+        if options:
+            for i, option in enumerate(options[:4]):
+                self.canvas.create_oval(x + 24, yy + i * 34 - 2, x + 50, yy + i * 34 + 24, fill="#ffffff", outline=COLORS["line"])
+                self.text(x + 37, yy + i * 34 + 11, chr(65 + i), size=10, fill="#526071", anchor="center")
+                self.text(x + 66, yy + i * 34 + 2, str(option), size=11, fill="#3b4659", width=w - 96)
         else:
-            self.current_item_id = None
-            self.question_text.set("今天没有到期复习项。可以导入新资料生成题卡。")
+            self.canvas.round_rect(x + 20, yy, x + w - 20, yy + 48, radius=6, fill="#f7fcfd", outline="#bceaf0")
+            self.text(x + 34, yy + 16, f"答案：{item.get('answer', '')[:80]}", size=11, fill="#18808b")
+        self.canvas.create_line(x, y + h - 56, x + w, y + h - 56, fill=COLORS["line_soft"])
+        self.canvas.round_rect(x + 20, y + h - 38, x + 92, y + h - 14, radius=6, fill=COLORS["blue_soft"], outline="")
+        self.text(x + 56, y + h - 26, f"答案：{item.get('answer', '')[:12]}", size=10, fill=COLORS["blue"], weight="bold", anchor="center")
+        self.text(x + w - 140, y + h - 28, "⧉  复制", size=10, fill=COLORS["muted"])
+        self.text(x + w - 74, y + h - 28, "☆  收藏", size=10, fill=COLORS["muted"])
 
-    def refresh_library(self) -> None:
-        for item in self.library.get_children():
-            self.library.delete(item)
-        for study_set in self.store.sets:
-            self.library.insert(
-                "",
-                END,
-                iid=study_set["id"],
-                text=study_set["title"],
-                values=(len(study_set.get("items", [])), study_set.get("source", ""), time.strftime("%Y-%m-%d %H:%M", time.localtime(study_set.get("created_at", 0)))),
-            )
-
-    def select_review_item(self, _event=None) -> None:
-        selected = self.review_list.selection()
-        if not selected:
-            return
-        self.current_item_id = selected[0]
-        item = self.find_item(self.current_item_id)
-        if item:
-            self.render_question(item, show_answer=False)
-
-    def render_question(self, item: dict, show_answer: bool) -> None:
-        lines = [f"题目：{item['prompt']}"]
-        if item.get("options"):
-            for index, option in enumerate(item["options"]):
-                lines.append(f"{chr(65 + index)}. {option}")
-        if show_answer:
-            lines.append("")
-            lines.append(f"参考答案：{item.get('answer', '')}")
-        self.question_text.set("\n".join(lines))
-
-    def show_answer(self) -> None:
-        item = self.find_item(self.current_item_id)
-        if item:
-            self.render_question(item, show_answer=True)
-
-    def grade_current(self, grade: int) -> None:
-        item = self.find_item(self.current_item_id)
-        if not item:
-            return
-        old_interval = item.get("interval", 0)
-        interval = 0 if grade == 1 else max(1, old_interval) if grade == 2 else round(old_interval * (2.4 if grade == 4 else 1.8)) if old_interval else grade
-        days = 0.15 if grade == 1 else interval
-        item["interval"] = interval
-        item["ease"] = max(1.3, min(3.2, item.get("ease", 2.4) + (grade - 3) * 0.15))
-        item["reviewed"] = item.get("reviewed", 0) + 1
-        item["lapses"] = item.get("lapses", 0) + (1 if grade == 1 else 0)
-        item["due_at"] = now_ms() + int(days * 24 * 60 * 60 * 1000)
-        item["difficulty"] = "困难" if grade == 1 else "中等" if grade == 2 else "简单"
-        self.store.review_log.append({"item_id": item["id"], "grade": grade, "at": int(time.time())})
+    def set_choice(self, variable, value):
+        variable.set(value)
+        self.store.settings.question_type = self.question_type.get()
+        self.store.settings.difficulty = self.difficulty.get()
         self.store.save()
-        self.refresh_all()
+        self.render()
 
-    def find_item(self, item_id: str | None) -> dict | None:
-        for item in self.store.all_items():
-            if item["id"] == item_id:
-                return item
-        return None
-
-    def choose_files(self) -> None:
+    def choose_files(self):
         paths = filedialog.askopenfilenames(
-            title="选择复习资料",
+            title="选择学习资料",
             filetypes=[
                 ("学习资料", "*.pdf *.png *.jpg *.jpeg *.webp *.txt *.md *.csv *.json"),
                 ("所有文件", "*.*"),
@@ -452,14 +573,48 @@ class StartThinkingApp:
         )
         if not paths:
             return
-        self.run_background(lambda: self.process_files([Path(path) for path in paths]), "正在识别文件...")
+        self.uploaded_files = [Path(path) for path in paths]
+        self.run_background(lambda: self.process_files(self.uploaded_files), "正在识别文件并自动生成题目...")
 
-    def process_files(self, paths: list[Path]) -> None:
+    def generate_from_current_files(self):
+        if self.uploaded_files:
+            self.run_background(lambda: self.process_files(self.uploaded_files), "正在重新生成题目...")
+        else:
+            self.choose_files()
+
+    def run_background(self, fn, status):
+        if self.busy:
+            return
+        self.busy = True
+        self.status_text = status
+        self.render()
+        threading.Thread(target=self.safe_run, args=(fn,), daemon=True).start()
+
+    def safe_run(self, fn):
+        try:
+            fn()
+        except Exception as exc:
+            self.queue.put(("error", str(exc)))
+        finally:
+            self.queue.put(("idle", "就绪"))
+
+    def process_files(self, paths: list[Path]):
+        created = 0
         for file_path in paths:
-            text = self.extract_text(file_path)
-            generated = self.generate_questions(file_path.stem, text, file_path.name)
-            self.store.add_set(generated)
-        self.queue.put(("done", f"已导入 {len(paths)} 个文件"))
+            try:
+                self.queue.put(("info", f"正在识别：{file_path.name}"))
+                text = self.extract_text(file_path)
+                if len(text.strip()) < 20:
+                    raise RuntimeError("识别文本太短，无法生成题目")
+                self.queue.put(("info", f"正在出题：{file_path.name}"))
+                generated = self.generate_questions(file_path.stem, text, file_path.name)
+                self.store.add_set(generated, status="已解析")
+                created += 1
+            except Exception as exc:
+                fallback = local_generate(file_path.stem, f"文件 {file_path.name} 处理失败：{exc}", file_path.name, 4)
+                self.store.add_set(fallback, status="失败")
+                self.queue.put(("error", f"{file_path.name} 处理失败：{exc}"))
+        self.queue.put(("done", f"已处理 {len(paths)} 个文件，生成 {created} 个学习集"))
 
     def extract_text(self, file_path: Path) -> str:
         if file_path.suffix.lower() in TEXT_EXTS:
@@ -472,10 +627,11 @@ class StartThinkingApp:
 
     def run_unlimited_ocr(self, file_path: Path) -> str:
         settings = self.store.settings
-        if not settings.unlimited_ocr_script:
-            raise RuntimeError("请先在设置里填写 Unlimited-OCR infer.py 路径")
+        script = Path(settings.unlimited_ocr_script)
+        if not script.exists():
+            raise RuntimeError("未找到 Unlimited-OCR infer.py")
         output_dir = Path(tempfile.mkdtemp(prefix="startthinking-ocr-"))
-        args = [settings.python_path, settings.unlimited_ocr_script]
+        args = [settings.python_path, str(script)]
         if file_path.suffix.lower() == ".pdf":
             args += ["--pdf", str(file_path)]
         elif file_path.suffix.lower() in IMAGE_EXTS:
@@ -487,7 +643,7 @@ class StartThinkingApp:
         args += ["--output_dir", str(output_dir), "--concurrency", str(settings.ocr_concurrency), "--image_mode", settings.ocr_image_mode]
         result = subprocess.run(args, cwd=APP_DIR, text=True, capture_output=True, timeout=1200)
         if result.returncode != 0:
-            raise RuntimeError(result.stderr or result.stdout or "Unlimited-OCR 执行失败")
+            raise RuntimeError((result.stderr or result.stdout or "Unlimited-OCR 执行失败")[:400])
         text = self.collect_text(output_dir)
         if not text.strip():
             raise RuntimeError("Unlimited-OCR 没有输出可读取文本")
@@ -526,7 +682,6 @@ class StartThinkingApp:
         return image_paths
 
     def ocr_image_with_ollama(self, image_path: Path, page_number: int) -> str:
-        encoded = base64.b64encode(image_path.read_bytes()).decode("utf-8")
         payload = {
             "model": self.store.settings.ollama_model,
             "stream": False,
@@ -535,25 +690,17 @@ class StartThinkingApp:
                 {
                     "role": "user",
                     "content": (
-                        "请对这张学习资料图片做 OCR。只输出可复制的正文文本。"
-                        "保留标题、段落、列表、公式和表格中的关键信息。"
+                        "请对这张学习资料图片做 OCR。只输出可复制的正文文本，保留标题、段落、列表、公式和表格中的关键信息。"
                         "不要解释，不要总结，不要添加资料中没有的内容。"
                         f"这是第 {page_number} 页。"
                     ),
-                    "images": [encoded],
+                    "images": [base64.b64encode(image_path.read_bytes()).decode("utf-8")],
                 }
             ],
             "options": {"temperature": 0, "num_predict": 4096},
         }
-        req = urllib.request.Request(
-            self.store.settings.ollama_url.rstrip("/") + "/api/chat",
-            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-            headers={"Content-Type": "application/json"},
-            method="POST",
-        )
-        with urllib.request.urlopen(req, timeout=180) as response:
-            raw = json.loads(response.read().decode("utf-8"))
-        message = raw.get("message", {})
+        response = self.ollama_post("/api/chat", payload, timeout=180)
+        message = response.get("message", {})
         return message.get("content", "") or message.get("thinking", "")
 
     def collect_text(self, directory: Path) -> str:
@@ -563,23 +710,10 @@ class StartThinkingApp:
                 parts.append(path.read_text(encoding="utf-8", errors="ignore"))
         return "\n\n".join(parts)
 
-    def generate_from_text(self) -> None:
-        text = self.material_text.get().strip()
-        if len(text) < 30:
-            messagebox.showwarning("资料太短", "请至少粘贴一小段完整笔记。")
-            return
-        self.run_background(lambda: self.process_pasted_text(text), "正在调用 qwen3.5:4b 生成题卡...")
-
-    def process_pasted_text(self, text: str) -> None:
-        generated = self.generate_questions(guess_title(text), text, "粘贴资料")
-        self.store.add_set(generated)
-        self.queue.put(("done", "已生成新的学习集"))
-
     def generate_questions(self, title: str, text: str, source: str) -> dict:
-        settings = self.store.settings
         try:
             payload = {
-                "model": settings.ollama_model,
+                "model": self.store.settings.ollama_model,
                 "stream": False,
                 "think": False,
                 "messages": [
@@ -588,24 +722,18 @@ class StartThinkingApp:
                 ],
                 "options": {"temperature": 0.2, "num_predict": 8192},
             }
-            req = urllib.request.Request(
-                settings.ollama_url.rstrip("/") + "/api/chat",
-                data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
-                headers={"Content-Type": "application/json"},
-                method="POST",
-            )
-            with urllib.request.urlopen(req, timeout=180) as response:
-                raw = json.loads(response.read().decode("utf-8"))
-            message = raw.get("message", {})
+            response = self.ollama_post("/api/chat", payload, timeout=240)
+            message = response.get("message", {})
             content = message.get("content", "") or message.get("thinking", "")
             return normalize_generated(parse_json_from_text(content), title, text, source)
         except Exception as exc:
-            self.queue.put(("info", f"Ollama 不可用，已回退本地规则：{exc}"))
-            return local_generate(title, text, source, settings.generation_count)
+            self.queue.put(("info", f"Ollama JSON 出题失败，已回退本地规则：{exc}"))
+            return local_generate(title, text, source, self.store.settings.generation_count)
 
     def build_prompt(self, title: str, text: str) -> str:
+        count = self.store.settings.generation_count
         return f"""你是严谨的个人复习出题助手。请只基于给定资料生成复习内容，不要编造资料外事实。
-输出必须是严格 JSON，不要 Markdown，不要解释。结构：
+输出必须是严格 JSON，不要 Markdown，不要解释。结构如下：
 {{
   "title": "学习集标题",
   "questions": [
@@ -617,120 +745,59 @@ class StartThinkingApp:
     {{"front":"卡片正面","back":"卡片背面","difficulty":"简单|中等|困难","topic":"知识点"}}
   ]
 }}
-题目总数约 {self.store.settings.generation_count} 个，闪卡约 {max(4, self.store.settings.generation_count // 2)} 张。
+要求：
+- 题目总数约 {count} 个，闪卡约 {max(4, count // 2)} 张。
+- 题目类型偏向：{self.question_type.get()}。
+- 难度等级偏向：{self.difficulty.get()}。
+- 单选题选项必须互斥，答案必须与选项之一完全一致。
 
 标题：{title}
 
 资料：
 {text[:24000]}"""
 
-    def fill_sample(self) -> None:
-        self.material_text.set(SAMPLE_TEXT)
+    def ollama_post(self, path, payload, timeout=180):
+        req = urllib.request.Request(
+            self.store.settings.ollama_url.rstrip("/") + path,
+            data=json.dumps(payload, ensure_ascii=False).encode("utf-8"),
+            headers={"Content-Type": "application/json"},
+            method="POST",
+        )
+        with urllib.request.urlopen(req, timeout=timeout) as response:
+            return json.loads(response.read().decode("utf-8"))
 
-    def pick_ocr_script(self) -> None:
-        path = filedialog.askopenfilename(title="选择 Unlimited-OCR infer.py", filetypes=[("Python", "*.py"), ("所有文件", "*.*")])
-        if path:
-            self.vars["unlimited_ocr_script"].set(path)
-
-    def save_settings(self) -> None:
-        settings = self.store.settings
-        settings.ollama_url = self.vars["ollama_url"].get().strip()
-        settings.ollama_model = self.vars["ollama_model"].get().strip() or "qwen3.5:4b"
-        settings.python_path = self.vars["python_path"].get().strip() or "python"
-        settings.unlimited_ocr_script = self.vars["unlimited_ocr_script"].get().strip()
-        settings.ocr_concurrency = int(self.vars["ocr_concurrency"].get() or 2)
-        settings.ocr_image_mode = self.vars["ocr_image_mode"].get().strip() or "gundam"
-        settings.generation_count = int(self.vars["generation_count"].get() or 12)
-        self.store.save()
-        self.status.set("设置已保存")
-
-    def check_services(self) -> None:
-        self.save_settings()
-        self.run_background(self.do_check_services, "正在检测服务...")
-
-    def do_check_services(self) -> None:
-        lines = []
-        try:
-            with urllib.request.urlopen(self.store.settings.ollama_url.rstrip("/") + "/api/tags", timeout=5) as response:
-                lines.append(f"Ollama：可用 ({response.status})，默认模型 {self.store.settings.ollama_model}")
-        except Exception as exc:
-            lines.append(f"Ollama：不可用，{exc}")
-        script = self.store.settings.unlimited_ocr_script
-        if script and Path(script).exists():
-            lines.append(f"Unlimited-OCR：已找到 {script}")
-        else:
-            lines.append("Unlimited-OCR：未设置 infer.py 或文件不存在")
-        self.queue.put(("service", "\n".join(lines)))
-
-    def pull_qwen(self) -> None:
-        self.run_background(lambda: self.run_command(["ollama", "pull", "qwen3.5:4b"]), "正在拉取 qwen3.5:4b...")
-
-    def run_command(self, args: list[str]) -> None:
-        result = subprocess.run(args, text=True, capture_output=True, timeout=1800)
-        if result.returncode != 0:
-            raise RuntimeError(result.stderr or result.stdout or "命令失败")
-        self.queue.put(("done", result.stdout[-500:] or "命令完成"))
-
-    def export_backup(self) -> None:
-        path = filedialog.asksaveasfilename(defaultextension=".json", filetypes=[("JSON", "*.json")], initialfile="startthinking-backup.json")
-        if path:
-            shutil.copy2(DATA_FILE, path)
-            self.status.set(f"已导出：{path}")
-
-    def run_background(self, fn, status: str) -> None:
-        self.status.set(status)
-        threading.Thread(target=self.safe_run, args=(fn,), daemon=True).start()
-
-    def safe_run(self, fn) -> None:
-        try:
-            fn()
-        except Exception as exc:
-            self.queue.put(("error", str(exc)))
-
-    def consume_queue(self) -> None:
+    def consume_queue(self):
         try:
             while True:
                 kind, message = self.queue.get_nowait()
                 if kind == "error":
-                    messagebox.showerror("操作失败", message)
-                    self.status.set("失败")
-                elif kind == "service":
-                    self.service_text.set(message)
-                    self.status.set("检测完成")
+                    self.status_text = message
+                    messagebox.showerror("处理失败", message)
                 elif kind == "info":
-                    self.status.set(message)
-                else:
-                    self.status.set(message)
-                    self.refresh_all()
+                    self.status_text = message
+                elif kind == "done":
+                    self.status_text = message
+                elif kind == "idle":
+                    self.busy = False
+                    self.status_text = message
+                self.render()
         except queue.Empty:
             pass
         self.root.after(200, self.consume_queue)
 
 
-class TextWithScrollbar(ttk.Frame):
-    def __init__(self, parent, height: int | None = None):
-        super().__init__(parent)
-        import tkinter as tk
-
-        self.text = tk.Text(self, wrap="word", height=height or 18, font=("Microsoft YaHei UI", 11))
-        scrollbar = ttk.Scrollbar(self, orient="vertical", command=self.text.yview)
-        self.text.configure(yscrollcommand=scrollbar.set)
-        self.text.pack(side="left", fill="both", expand=True)
-        scrollbar.pack(side="right", fill="y")
-
-    def set(self, value: str) -> None:
-        self.text.delete("1.0", END)
-        self.text.insert("1.0", value)
-
-    def get(self) -> str:
-        return self.text.get("1.0", END)
+def normalize_generated(data: dict, title: str, text: str, source: str) -> dict:
+    if not isinstance(data, dict):
+        raise ValueError("模型返回内容不是 JSON 对象")
+    questions = data.get("questions") or []
+    cards = data.get("cards") or []
+    if not isinstance(questions, list) or not isinstance(cards, list):
+        raise ValueError("模型 JSON 缺少 questions/cards 数组")
+    return {"title": data.get("title") or title, "source": source, "text": text, "questions": questions[:40], "cards": cards[:40]}
 
 
-def main() -> None:
-    root = Tk()
-    style = ttk.Style(root)
-    if "vista" in style.theme_names():
-        style.theme_use("vista")
+def main():
+    root = tk.Tk()
     StartThinkingApp(root)
     root.mainloop()
 
