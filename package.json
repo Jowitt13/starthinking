@@ -1,0 +1,14 @@
+{
+  "name": "startthinking-desktop",
+  "version": "0.2.0",
+  "description": "Local desktop review app with Unlimited-OCR and local LLM integration.",
+  "main": "desktop/main.js",
+  "private": true,
+  "scripts": {
+    "start": "electron .",
+    "check": "node --check src/app.js && node --check desktop/main.js && node --check desktop/preload.js"
+  },
+  "devDependencies": {
+    "electron": "^33.4.11"
+  }
+}

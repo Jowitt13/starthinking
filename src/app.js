@@ -1,4 +1,5 @@
-const STORAGE_KEY = "startthinking-state-v1";
+const STORAGE_KEY = "startthinking-desktop-state-v2";
+const desktop = window.StartThinkingDesktop;
 
 const icons = {
   brain:
@@ -41,33 +42,47 @@ const initialState = {
   revealAnswer: false,
   currentReviewId: null,
   pasteText: sampleText,
+  busy: "",
+  serviceStatus: null,
   settings: {
     dailyTarget: 35,
     generationCount: 12,
     autoAddQueue: true,
-    provider: "local",
-    endpoint: "",
-    apiKey: "",
+    llmProvider: "ollama",
+    ollamaUrl: "http://127.0.0.1:11434",
+    ollamaModel: "qwen3.5:4b",
+    pythonPath: "python",
+    unlimitedOcrScript: "",
+    ocrConcurrency: 2,
+    ocrImageMode: "gundam",
+    ocrTimeoutMs: 1200000,
   },
   sets: [],
   reviewLog: [],
 };
 
-let state;
-state = loadState();
+let state = loadState();
 
 function loadState() {
   try {
     const raw = localStorage.getItem(STORAGE_KEY);
     if (!raw) return seedState();
-    return { ...initialState, ...JSON.parse(raw) };
+    return mergeState(initialState, JSON.parse(raw));
   } catch {
     return seedState();
   }
 }
 
+function mergeState(base, saved) {
+  return {
+    ...base,
+    ...saved,
+    settings: { ...base.settings, ...(saved.settings || {}) },
+  };
+}
+
 function seedState() {
-  const seed = { ...initialState, sets: [], reviewLog: [] };
+  const seed = mergeState(initialState, {});
   const generated = createStudySet("机器学习：监督学习笔记", sampleText, "示例资料");
   generated.createdAt = new Date(Date.now() - 1000 * 60 * 60 * 28).toISOString();
   seed.sets = [generated];
@@ -80,7 +95,7 @@ function saveState() {
 }
 
 function setState(patch) {
-  state = { ...state, ...patch };
+  state = mergeState(state, patch);
   saveState();
   render();
 }
@@ -107,18 +122,12 @@ function formatDate(value) {
   }).format(new Date(value));
 }
 
-function startOfToday() {
-  const date = new Date();
-  date.setHours(0, 0, 0, 0);
-  return date;
-}
-
 function clamp(value, min, max) {
   return Math.max(min, Math.min(max, value));
 }
 
 function splitMaterial(text) {
-  const normalized = text
+  const normalized = String(text || "")
     .replace(/\r/g, "\n")
     .replace(/[ \t]+/g, " ")
     .replace(/\n{3,}/g, "\n\n")
@@ -144,8 +153,7 @@ function extractKeyword(sentence, index) {
 
 function makeDistractors(keyword, pool) {
   const defaults = ["正则化", "混淆矩阵", "梯度下降", "监督学习", "特征缩放", "交叉验证", "召回率"];
-  const values = [...new Set([...pool, ...defaults].filter((item) => item !== keyword))];
-  return values.slice(0, 3);
+  return [...new Set([...pool, ...defaults].filter((item) => item && item !== keyword))].slice(0, 3);
 }
 
 function createStudySet(title, text, sourceName = "粘贴资料") {
@@ -153,35 +161,23 @@ function createStudySet(title, text, sourceName = "粘贴资料") {
   const keywords = paragraphs.map(extractKeyword);
   const count = clamp(Number(state?.settings?.generationCount || 12), 4, 30);
   const selected = paragraphs.slice(0, count);
+  const setId = uid("set");
+
   const items = selected.map((paragraph, index) => {
     const keyword = extractKeyword(paragraph, index);
     const type = index % 5 === 2 ? "short" : index % 4 === 1 ? "cloze" : "single";
-    const dueOffset = index < 5 ? -1 : index * 1000 * 60 * 7;
-    const base = {
-      id: uid("item"),
-      setId: "",
-      type,
-      topic: keyword,
-      source: sourceName,
-      prompt: "",
-      answer: paragraph,
-      difficulty: index % 4 === 0 ? "困难" : index % 3 === 0 ? "简单" : "中等",
-      interval: 0,
-      ease: 2.45,
-      dueAt: new Date(Date.now() + dueOffset).toISOString(),
-      lapses: 0,
-      reviewed: 0,
-      createdAt: new Date().toISOString(),
-    };
+    const base = baseReviewItem({ setId, type, topic: keyword, source: sourceName, index });
+
     if (type === "cloze") {
       base.prompt = paragraph.replace(keyword, "______");
       base.answer = keyword;
       base.context = paragraph;
     } else if (type === "short") {
       base.prompt = `简述「${keyword}」相关知识点。`;
+      base.answer = paragraph;
     } else {
       const distractors = makeDistractors(keyword, keywords);
-      base.prompt = `关于这段资料，最关键的概念是哪一个？`;
+      base.prompt = "关于这段资料，最关键的概念是哪一个？";
       base.options = shuffle([keyword, ...distractors]).slice(0, 4);
       base.answer = keyword;
       base.context = paragraph;
@@ -192,26 +188,11 @@ function createStudySet(title, text, sourceName = "粘贴资料") {
   const cards = selected.slice(0, Math.max(4, Math.floor(count * 0.7))).map((paragraph, index) => {
     const keyword = extractKeyword(paragraph, index + 2);
     return {
-      id: uid("card"),
-      setId: "",
-      type: "card",
-      topic: keyword,
-      source: sourceName,
+      ...baseReviewItem({ setId, type: "card", topic: keyword, source: sourceName, index }),
       prompt: keyword,
       answer: paragraph,
       difficulty: index % 3 === 0 ? "中等" : "简单",
-      interval: 0,
-      ease: 2.5,
-      dueAt: new Date(Date.now() + index * 1000 * 60 * 12).toISOString(),
-      lapses: 0,
-      reviewed: 0,
-      createdAt: new Date().toISOString(),
     };
-  });
-
-  const setId = uid("set");
-  [...items, ...cards].forEach((item) => {
-    item.setId = setId;
   });
 
   return {
@@ -223,6 +204,70 @@ function createStudySet(title, text, sourceName = "粘贴资料") {
     items,
     cards,
   };
+}
+
+function createStudySetFromAi(payload, text, sourceName) {
+  const setId = uid("set");
+  const title = payload.title || guessTitle(text);
+  const questions = (payload.questions || []).map((question, index) => ({
+    ...baseReviewItem({
+      setId,
+      type: question.type || "short",
+      topic: question.topic || extractKeyword(question.prompt || question.answer || text, index),
+      source: sourceName,
+      index,
+    }),
+    prompt: question.prompt || "请回忆这个知识点。",
+    options: Array.isArray(question.options) ? question.options.slice(0, 4) : undefined,
+    answer: question.answer || "",
+    difficulty: normalizeDifficulty(question.difficulty),
+  }));
+
+  const cards = (payload.cards || []).map((card, index) => ({
+    ...baseReviewItem({
+      setId,
+      type: "card",
+      topic: card.topic || extractKeyword(card.front || card.back || text, index),
+      source: sourceName,
+      index,
+    }),
+    prompt: card.front || card.prompt || "知识卡片",
+    answer: card.back || card.answer || "",
+    difficulty: normalizeDifficulty(card.difficulty),
+  }));
+
+  return {
+    id: setId,
+    title,
+    sourceName,
+    createdAt: new Date().toISOString(),
+    text,
+    items: questions.length ? questions : createStudySet(title, text, sourceName).items,
+    cards: cards.length ? cards : createStudySet(title, text, sourceName).cards,
+  };
+}
+
+function baseReviewItem({ setId, type, topic, source, index }) {
+  return {
+    id: uid(type === "card" ? "card" : "item"),
+    setId,
+    type,
+    topic,
+    source,
+    prompt: "",
+    answer: "",
+    difficulty: index % 4 === 0 ? "困难" : index % 3 === 0 ? "简单" : "中等",
+    interval: 0,
+    ease: 2.45,
+    dueAt: new Date(Date.now() + (index < 5 ? -1 : index * 1000 * 60 * 7)).toISOString(),
+    lapses: 0,
+    reviewed: 0,
+    createdAt: new Date().toISOString(),
+  };
+}
+
+function normalizeDifficulty(value) {
+  return ["简单", "中等", "困难"].includes(value) ? value : "中等";
 }
 
 function guessTitle(text) {
@@ -267,21 +312,17 @@ function studyStats() {
   const items = allItems();
   const totalReviews = items.reduce((sum, item) => sum + (item.reviewed || 0), 0);
   const mastered = items.filter((item) => (item.interval || 0) >= 5).length;
-  const correctRate = totalReviews
-    ? Math.round(
-        (state.reviewLog.filter((entry) => entry.grade >= 3).length / state.reviewLog.length) * 100,
-      )
+  const correctRate = state.reviewLog.length
+    ? Math.round((state.reviewLog.filter((entry) => entry.grade >= 3).length / state.reviewLog.length) * 100)
     : 78;
-  const due = dueItems().length;
   return {
-    totalSets: state.sets.length,
     totalItems: items.length,
     totalCards: state.sets.reduce((sum, set) => sum + set.cards.length, 0),
     totalQuestions: state.sets.reduce((sum, set) => sum + set.items.length, 0),
     totalReviews,
     mastered,
     correctRate,
-    due,
+    due: dueItems().length,
   };
 }
 
@@ -298,8 +339,7 @@ function navItems() {
 
 function render() {
   const stats = studyStats();
-  const app = document.querySelector("#app");
-  app.innerHTML = `
+  document.querySelector("#app").innerHTML = `
     <div class="app-shell ${state.drawerOpen ? "drawer-open" : ""}">
       ${renderSidebar(stats)}
       <main class="main">
@@ -307,7 +347,7 @@ function render() {
         <section class="workspace">${renderView()}</section>
       </main>
       ${renderDrawer()}
-      <div class="toast" id="toast"></div>
+      <div class="toast ${state.busy ? "show" : ""}" id="toast">${escapeHtml(state.busy)}</div>
     </div>
   `;
   bindEvents();
@@ -331,17 +371,15 @@ function renderSidebar(stats) {
       </nav>
       <div class="streak-card">
         <div class="mini-label">今日连续学习</div>
-        <div class="streak-number">${Math.max(1, state.reviewLog.length ? 13 : 12)} 天</div>
+        <div class="streak-number">12 天</div>
         <div class="mini-label">连续学习，加油</div>
-        <div class="week-dots">
-          ${["一", "二", "三", "四", "五", "六", "日"]
-            .map((day, index) => `<span class="dot ${index < 6 ? "done" : ""}">${index < 6 ? "✓" : ""}</span>`)
-            .join("")}
-        </div>
+        <div class="week-dots">${[0, 1, 2, 3, 4, 5, 6]
+          .map((day) => `<span class="dot ${day < 6 ? "done" : ""}">${day < 6 ? "✓" : ""}</span>`)
+          .join("")}</div>
       </div>
       <div class="profile-card">
         <div class="avatar">L</div>
-        <div><strong>Leo:00</strong><div class="mini-label">${stats.totalItems} 个复习项</div></div>
+        <div><strong>Local</strong><div class="mini-label">${stats.totalItems} 个复习项</div></div>
       </div>
     </aside>
   `;
@@ -356,7 +394,7 @@ function renderTopbar(stats) {
         <div class="stat-inline">今日待复习 <strong>${stats.due}</strong></div>
         <div class="stat-inline">${icons.clock} 预计用时 <strong>${Math.max(8, Math.ceil(stats.due * 1.4))}</strong> 分钟</div>
         <button class="btn primary" data-action="choose-file">${icons.upload} 导入资料</button>
-        <input class="file-input" type="file" id="file-input" multiple accept=".txt,.md,.csv,.json,.pdf,.docx,.pptx" />
+        <input class="file-input" type="file" id="file-input" multiple accept=".txt,.md,.csv,.json,.pdf,.docx,.pptx,.png,.jpg,.jpeg,.webp" />
       </div>
     </header>
   `;
@@ -397,7 +435,7 @@ function renderImportPanel() {
           <div>
             <div class="upload-icon">${icons.upload}</div>
             <h2>导入学习资料</h2>
-            <p>TXT、MD、CSV 可直接解析；PDF、DOCX、PPTX 会保存文件名，可把正文粘贴到下方生成。</p>
+            <p>${desktop ? "PDF、图片会交给 Unlimited-OCR；TXT、MD、CSV 直接读取。" : "当前是浏览器模式；桌面版才支持 Unlimited-OCR 文件识别。"}</p>
             <button class="btn primary" data-action="choose-file">选择文件</button>
           </div>
         </div>
@@ -405,7 +443,7 @@ function renderImportPanel() {
           <textarea id="paste-text" placeholder="把课堂笔记、教材段落、错题解析粘贴在这里...">${escapeHtml(state.pasteText)}</textarea>
           <div class="pill-row">
             <button class="btn ghost" data-action="use-sample">填入示例</button>
-            <button class="btn primary" data-action="generate-from-paste">${icons.spark} 从文本生成</button>
+            <button class="btn primary" data-action="generate-from-paste">${icons.spark} ${desktop ? "用本地模型生成" : "从文本生成"}</button>
           </div>
         </div>
       </div>
@@ -427,8 +465,7 @@ function renderModePanel() {
           .map(
             ([key, title, desc]) => `
               <button class="mode-card ${state.mode === key ? "active" : ""}" data-mode="${key}">
-                <span><strong>${title}</strong><span>${desc}</span></span>
-                <span>›</span>
+                <span><strong>${title}</strong><span>${desc}</span></span><span>›</span>
               </button>
             `,
           )
@@ -447,11 +484,7 @@ function renderQueuePanel(limit = 5) {
         <button class="btn ghost" data-view="review">查看全部</button>
       </div>
       <div class="list">
-        ${
-          queue.length
-            ? queue.map(renderQueueRow).join("")
-            : `<div class="empty">今天暂时清空了。可以导入新资料，或者去资料库手动复习。</div>`
-        }
+        ${queue.length ? queue.map(renderQueueRow).join("") : `<div class="empty">今天暂时清空了。可以导入新资料。</div>`}
       </div>
     </section>
   `;
@@ -480,13 +513,7 @@ function renderRecentPanel() {
         <h2>最近生成的学习集</h2>
         <button class="btn ghost" data-view="library">查看全部</button>
       </div>
-      <div class="list">
-        ${
-          sets.length
-            ? sets.map(renderSetRow).join("")
-            : `<div class="empty">还没有资料。先粘贴一段笔记试试。</div>`
-        }
-      </div>
+      <div class="list">${sets.length ? sets.map(renderSetRow).join("") : `<div class="empty">还没有资料。</div>`}</div>
     </section>
   `;
 }
@@ -512,22 +539,14 @@ function renderWeakPanel() {
   const weak = weakTopics();
   return `
     <section class="panel flush">
-      <div class="panel-head">
-        <div><h2>薄弱知识点</h2><p>基于错题、重复次数和掌握间隔估算</p></div>
-      </div>
+      <div class="panel-head"><div><h2>薄弱知识点</h2><p>基于错题、重复次数和掌握间隔估算</p></div></div>
       <div class="panel-body weak-list">
         ${
           weak.length
             ? weak
                 .map((item) => {
                   const color = item.weakness > 72 ? "var(--coral)" : item.weakness > 48 ? "var(--amber)" : "var(--green)";
-                  return `
-                    <div class="weak-row">
-                      <strong>${escapeHtml(item.topic)}</strong>
-                      <div class="bar" style="--bar-color:${color}"><span style="--value:${item.weakness}%"></span></div>
-                      <span style="color:${color};font-weight:800">${item.weakness}%</span>
-                    </div>
-                  `;
+                  return `<div class="weak-row"><strong>${escapeHtml(item.topic)}</strong><div class="bar" style="--bar-color:${color}"><span style="--value:${item.weakness}%"></span></div><span style="color:${color};font-weight:800">${item.weakness}%</span></div>`;
                 })
                 .join("")
             : `<div class="empty">复习几轮后，这里会显示最值得回炉的知识点。</div>`
@@ -545,22 +564,13 @@ function renderProgressPanel() {
       <div class="panel-head"><h2>学习进度</h2><span class="pill">近 7 天</span></div>
       <div class="panel-body metric-grid">
         <div class="metrics">
-          <div class="metric"><span>复习卡片</span><strong>${stats.totalCards || 0}</strong></div>
+          <div class="metric"><span>复习卡片</span><strong>${stats.totalCards}</strong></div>
           <div class="metric"><span>正确率</span><strong>${stats.correctRate}%</strong></div>
           <div class="metric"><span>已掌握</span><strong>${stats.mastered}</strong></div>
         </div>
-        <div class="chart">
-          ${bars
-            .map(
-              (bar, index) => `
-                <div class="chart-col">
-                  <div class="chart-bar" style="--h:${bar}px"></div>
-                  <div class="chart-label">05/${14 + index}</div>
-                </div>
-              `,
-            )
-            .join("")}
-        </div>
+        <div class="chart">${bars
+          .map((bar, index) => `<div class="chart-col"><div class="chart-bar" style="--h:${bar}px"></div><div class="chart-label">05/${14 + index}</div></div>`)
+          .join("")}</div>
       </div>
     </section>
   `;
@@ -575,7 +585,7 @@ function renderLibrary() {
           <div><h2>全部复习项</h2><p>题目、填空和闪卡统一进入间隔复习。</p></div>
           <button class="btn danger" data-action="clear-data">${icons.trash} 清空数据</button>
         </div>
-        <div class="list">${allItems().slice(0, 40).map(renderQueueRow).join("") || `<div class="empty">还没有复习项。</div>`}</div>
+        <div class="list">${allItems().slice(0, 60).map(renderQueueRow).join("") || `<div class="empty">还没有复习项。</div>`}</div>
       </section>
     </div>
   `;
@@ -604,7 +614,7 @@ function renderReview() {
   const queue = dueItems();
   const current = allItems().find((item) => item.id === state.currentReviewId) || queue[0] || allItems()[0];
   if (!current) {
-    return `<div class="stack" style="grid-column:1 / -1"><section class="panel"><div class="empty">还没有可以复习的内容。先导入一段资料，我来帮你生成题目和闪卡。</div></section>${renderImportPanel()}</div>`;
+    return `<div class="stack" style="grid-column:1 / -1"><section class="panel"><div class="empty">还没有可以复习的内容。先导入资料。</div></section>${renderImportPanel()}</div>`;
   }
   return `
     <div class="stack" style="grid-column:1 / -1">
@@ -616,13 +626,7 @@ function renderReview() {
         <div class="review-question">
           <div>
             <h2>${escapeHtml(current.prompt)}</h2>
-            ${
-              current.options
-                ? `<div class="options">${current.options
-                    .map((option, index) => `<div class="option">${String.fromCharCode(65 + index)}. ${escapeHtml(option)}</div>`)
-                    .join("")}</div>`
-                : ""
-            }
+            ${current.options ? `<div class="options">${current.options.map((option, index) => `<div class="option">${String.fromCharCode(65 + index)}. ${escapeHtml(option)}</div>`).join("")}</div>` : ""}
             ${
               state.revealAnswer
                 ? `<div class="review-answer"><strong>参考答案：</strong>${escapeHtml(current.answer)}${current.context ? `<br /><span class="mini-label">${escapeHtml(current.context)}</span>` : ""}</div>`
@@ -643,19 +647,16 @@ function renderReview() {
 }
 
 function renderKnowledge() {
+  const topics = weakTopics()
+    .concat(allItems().slice(0, 12).map((item) => ({ topic: item.topic, weakness: 40, reviewed: item.reviewed, total: 1 })))
+    .slice(0, 18);
   return `
     <div class="stack" style="grid-column:1 / -1">
       ${renderWeakPanel()}
       <section class="panel flush">
         <div class="panel-head"><h2>知识点清单</h2></div>
         <div class="list">
-          ${weakTopics()
-            .concat(
-              allItems()
-                .slice(0, 12)
-                .map((item) => ({ topic: item.topic, weakness: 40, reviewed: item.reviewed, total: 1 })),
-            )
-            .slice(0, 18)
+          ${topics
             .map(
               (item) => `
                 <div class="row">
@@ -673,17 +674,34 @@ function renderKnowledge() {
 }
 
 function renderSettings() {
+  const status = state.serviceStatus;
   return `
     <div class="stack" style="grid-column:1 / -1">
       <section class="panel flush">
-        <div class="panel-head"><div><h2>个人设置</h2><p>所有配置只保存在当前浏览器。</p></div></div>
+        <div class="panel-head">
+          <div><h2>本地后端设置</h2><p>桌面版会在本机调用 Unlimited-OCR 和 Ollama，资料不上传云端。</p></div>
+          <button class="btn primary" data-action="check-services">检测服务</button>
+        </div>
         <div class="panel-body settings-grid">
           <label class="setting-row"><span>每日目标</span><input class="field" data-setting="dailyTarget" type="number" min="5" max="200" value="${state.settings.dailyTarget}" /></label>
           <label class="setting-row"><span>生成数量</span><input class="field" data-setting="generationCount" type="number" min="4" max="30" value="${state.settings.generationCount}" /></label>
-          <label class="setting-row"><span>出题方式</span><select class="select" data-setting="provider"><option value="local" ${state.settings.provider === "local" ? "selected" : ""}>本地启发式</option><option value="openai" ${state.settings.provider === "openai" ? "selected" : ""}>OpenAI 兼容接口（预留）</option></select></label>
-          <label class="setting-row"><span>接口地址</span><input class="field" data-setting="endpoint" placeholder="https://api.openai.com/v1/chat/completions" value="${escapeHtml(state.settings.endpoint)}" /></label>
-          <label class="setting-row"><span>API Key</span><input class="field" data-setting="apiKey" type="password" placeholder="只存本地浏览器" value="${escapeHtml(state.settings.apiKey)}" /></label>
-          <div class="pill-row" style="justify-content:flex-start"><button class="btn" data-action="export-json">导出备份</button><button class="btn danger" data-action="clear-data">清空本地数据</button></div>
+          <label class="setting-row"><span>本地模型</span><input class="field" data-setting="ollamaModel" value="${escapeHtml(state.settings.ollamaModel)}" placeholder="qwen3.5:4b" /></label>
+          <label class="setting-row"><span>Ollama 地址</span><input class="field" data-setting="ollamaUrl" value="${escapeHtml(state.settings.ollamaUrl)}" /></label>
+          <label class="setting-row"><span>Python</span><input class="field" data-setting="pythonPath" value="${escapeHtml(state.settings.pythonPath)}" placeholder="python" /></label>
+          <label class="setting-row"><span>Unlimited-OCR infer.py</span><input class="field" data-setting="unlimitedOcrScript" value="${escapeHtml(state.settings.unlimitedOcrScript)}" placeholder="C:\\path\\Unlimited-OCR\\infer.py" /></label>
+          <label class="setting-row"><span>OCR 并发</span><input class="field" data-setting="ocrConcurrency" type="number" min="1" max="8" value="${state.settings.ocrConcurrency}" /></label>
+          <label class="setting-row"><span>OCR 图像模式</span><select class="select" data-setting="ocrImageMode"><option value="gundam" ${state.settings.ocrImageMode === "gundam" ? "selected" : ""}>gundam（单图推荐）</option><option value="base" ${state.settings.ocrImageMode === "base" ? "selected" : ""}>base（多页/PDF稳）</option></select></label>
+          ${
+            status
+              ? `<div class="setting-row"><span>服务状态</span><div><p class="mini-label">Ollama：${escapeHtml(status.ollama.message)}</p><p class="mini-label">Unlimited-OCR：${escapeHtml(status.unlimitedOcr.message)}</p></div></div>`
+              : ""
+          }
+          <div class="pill-row" style="justify-content:flex-start">
+            <button class="btn" data-action="open-unlimited-ocr">打开 Unlimited-OCR</button>
+            <button class="btn" data-action="open-ollama-qwen">打开 Qwen3/Ollama</button>
+            <button class="btn" data-action="export-json">导出备份</button>
+            <button class="btn danger" data-action="clear-data">清空本地数据</button>
+          </div>
         </div>
       </section>
     </div>
@@ -692,9 +710,7 @@ function renderSettings() {
 
 function renderDrawer() {
   const latest = state.sets[0];
-  const questions = latest?.items || [];
-  const cards = latest?.cards || [];
-  const rows = state.drawerTab === "questions" ? questions : cards;
+  const rows = state.drawerTab === "questions" ? latest?.items || [] : latest?.cards || [];
   return `
     <aside class="drawer ${state.drawerOpen ? "open" : ""}">
       <div class="drawer-head">
@@ -705,13 +721,7 @@ function renderDrawer() {
         <button class="tab ${state.drawerTab === "questions" ? "active" : ""}" data-tab="questions">题目</button>
         <button class="tab ${state.drawerTab === "cards" ? "active" : ""}" data-tab="cards">闪卡</button>
       </div>
-      <div class="drawer-list">
-        ${
-          rows.length
-            ? rows.map(renderQuestionCard).join("")
-            : `<div class="empty">生成内容会出现在这里。</div>`
-        }
-      </div>
+      <div class="drawer-list">${rows.length ? rows.map(renderQuestionCard).join("") : `<div class="empty">生成内容会出现在这里。</div>`}</div>
       <div class="drawer-foot">
         <button class="btn" data-action="export-json">导出题目</button>
         <button class="btn primary" data-view="review">${icons.plus} 开始复习</button>
@@ -724,17 +734,8 @@ function renderQuestionCard(item, index) {
   return `
     <article class="question-card">
       <h3>${index + 1}. ${escapeHtml(item.prompt)}</h3>
-      ${
-        item.options
-          ? `<div class="options">${item.options
-              .map((option, optionIndex) => `<div class="option">${String.fromCharCode(65 + optionIndex)}. ${escapeHtml(option)}</div>`)
-              .join("")}</div>`
-          : ""
-      }
-      <div class="answer-line">
-        <span>答案：${escapeHtml(item.answer)}</span>
-        <span>难度：${escapeHtml(item.difficulty)}</span>
-      </div>
+      ${item.options ? `<div class="options">${item.options.map((option, optionIndex) => `<div class="option">${String.fromCharCode(65 + optionIndex)}. ${escapeHtml(option)}</div>`).join("")}</div>` : ""}
+      <div class="answer-line"><span>答案：${escapeHtml(item.answer)}</span><span>难度：${escapeHtml(item.difficulty)}</span></div>
     </article>
   `;
 }
@@ -749,15 +750,12 @@ function bindEvents() {
   document.querySelectorAll("[data-view]").forEach((button) => {
     button.addEventListener("click", () => setState({ view: button.dataset.view }));
   });
-
   document.querySelectorAll("[data-mode]").forEach((button) => {
     button.addEventListener("click", () => setState({ mode: button.dataset.mode }));
   });
-
   document.querySelectorAll("[data-tab]").forEach((button) => {
     button.addEventListener("click", () => setState({ drawerTab: button.dataset.tab }));
   });
-
   document.querySelectorAll("[data-setting]").forEach((input) => {
     input.addEventListener("change", () => {
       const value = input.type === "number" ? Number(input.value) : input.value === "true" ? true : input.value === "false" ? false : input.value;
@@ -766,28 +764,19 @@ function bindEvents() {
       toast("设置已保存");
     });
   });
-
-  const paste = document.querySelector("#paste-text");
-  if (paste) {
-    paste.addEventListener("input", () => {
-      state.pasteText = paste.value;
-      saveState();
-    });
-  }
-
-  document.querySelectorAll("[data-action]").forEach((button) => {
-    button.addEventListener("click", () => handleAction(button.dataset.action, button.dataset.id, button));
+  document.querySelector("#paste-text")?.addEventListener("input", (event) => {
+    state.pasteText = event.target.value;
+    saveState();
   });
-
+  document.querySelectorAll("[data-action]").forEach((button) => {
+    button.addEventListener("click", () => handleAction(button.dataset.action, button.dataset.id));
+  });
   document.querySelectorAll("[data-grade]").forEach((button) => {
     button.addEventListener("click", () => gradeCurrent(Number(button.dataset.grade)));
   });
-
-  const fileInput = document.querySelector("#file-input");
-  if (fileInput) fileInput.addEventListener("change", (event) => handleFiles([...event.target.files]));
-
+  document.querySelector("#file-input")?.addEventListener("change", (event) => handleBrowserFiles([...event.target.files]));
   const dropZone = document.querySelector("#drop-zone");
-  if (dropZone) {
+  if (dropZone && !desktop) {
     ["dragenter", "dragover"].forEach((eventName) => {
       dropZone.addEventListener(eventName, (event) => {
         event.preventDefault();
@@ -800,13 +789,13 @@ function bindEvents() {
         dropZone.classList.remove("dragging");
       });
     });
-    dropZone.addEventListener("drop", (event) => handleFiles([...event.dataTransfer.files]));
+    dropZone.addEventListener("drop", (event) => handleBrowserFiles([...event.dataTransfer.files]));
   }
 }
 
-function handleAction(action, id, element) {
-  if (action === "choose-file") document.querySelector("#file-input")?.click();
-  if (action === "generate-from-paste") generateFromPaste();
+async function handleAction(action, id) {
+  if (action === "choose-file") return chooseFiles();
+  if (action === "generate-from-paste") return generateFromPaste();
   if (action === "use-sample") {
     state.pasteText = sampleText;
     saveState();
@@ -814,13 +803,7 @@ function handleAction(action, id, element) {
     toast("已填入示例资料");
   }
   if (action === "toggle-drawer") setState({ drawerOpen: !state.drawerOpen });
-  if (action === "open-set") {
-    const set = state.sets.find((item) => item.id === id);
-    if (set) {
-      state.sets = [set, ...state.sets.filter((item) => item.id !== id)];
-      setState({ drawerOpen: true, drawerTab: "questions" });
-    }
-  }
+  if (action === "open-set") openSet(id);
   if (action === "start-review") setState({ view: "review", currentReviewId: id, revealAnswer: false });
   if (action === "reveal-answer") setState({ revealAnswer: true });
   if (action === "clear-data" && confirm("确定清空所有本地学习数据吗？")) {
@@ -831,57 +814,119 @@ function handleAction(action, id, element) {
     toast("已重置为示例数据");
   }
   if (action === "export-json") exportJson();
+  if (action === "check-services") checkServices();
+  if (action === "open-unlimited-ocr") desktop?.openExternal("https://github.com/baidu/Unlimited-OCR");
+  if (action === "open-ollama-qwen") desktop?.openExternal("https://ollama.com/library/qwen3");
 }
 
-async function handleFiles(files) {
-  if (!files.length) return;
-  let imported = 0;
-  for (const file of files) {
-    const extension = file.name.split(".").pop()?.toLowerCase();
-    if (["txt", "md", "csv", "json"].includes(extension)) {
-      const text = await file.text();
-      const set = createStudySet(file.name.replace(/\.[^.]+$/, ""), text, file.name);
-      state.sets = [set, ...state.sets];
-      imported += 1;
-    } else {
-      const set = createStudySet(
-        file.name.replace(/\.[^.]+$/, ""),
-        `已导入文件：${file.name}。浏览器静态页面无法直接解析 ${extension?.toUpperCase()} 正文，请把核心内容粘贴到生成区后重新生成。`,
-        file.name,
-      );
-      state.sets = [set, ...state.sets];
-      imported += 1;
-    }
-  }
-  state.drawerOpen = true;
-  state.drawerTab = "questions";
-  state.currentReviewId = dueItems(state)[0]?.id || null;
-  saveState();
-  render();
-  toast(`已导入 ${imported} 个学习集`);
+function openSet(id) {
+  const set = state.sets.find((item) => item.id === id);
+  if (!set) return;
+  state.sets = [set, ...state.sets.filter((item) => item.id !== id)];
+  setState({ drawerOpen: true, drawerTab: "questions" });
 }
 
-function generateFromPaste() {
-  const text = document.querySelector("#paste-text")?.value.trim() || "";
-  if (text.length < 30) {
-    toast("资料太短了，至少粘贴一小段完整笔记");
+async function chooseFiles() {
+  if (!desktop) {
+    document.querySelector("#file-input")?.click();
     return;
   }
-  const title = guessTitle(text);
-  const set = createStudySet(title, text, "粘贴资料");
+  try {
+    const files = await desktop.chooseFiles();
+    if (!files.length) return;
+    await withBusy("正在识别文件，首次运行 Unlimited-OCR 可能需要较久...", async () => {
+      const docs = await desktop.extractFiles({ files, settings: state.settings });
+      for (const doc of docs) await addDocumentAsSet(doc);
+      toast(`已导入 ${docs.length} 个文件`);
+    });
+  } catch (error) {
+    toast(error.message || "导入失败");
+  }
+}
+
+async function handleBrowserFiles(files) {
+  if (!files.length) return;
+  await withBusy("正在读取浏览器文件...", async () => {
+    for (const file of files) {
+      const ext = file.name.split(".").pop()?.toLowerCase();
+      if (!["txt", "md", "csv", "json"].includes(ext)) {
+        throw new Error("浏览器模式不能识别 PDF/图片；请运行桌面版。");
+      }
+      await addDocumentAsSet({ name: file.name, text: await file.text(), method: "browser" });
+    }
+  });
+}
+
+async function addDocumentAsSet(doc) {
+  const title = doc.name?.replace(/\.[^.]+$/, "") || guessTitle(doc.text);
+  const set = await buildStudySet(title, doc.text, `${doc.name || "资料"} · ${doc.method || "文本"}`);
   state.sets = [set, ...state.sets];
   state.drawerOpen = true;
   state.drawerTab = "questions";
   state.currentReviewId = dueItems(state)[0]?.id || set.items[0]?.id;
   saveState();
   render();
-  toast(`已生成 ${set.items.length} 道题和 ${set.cards.length} 张闪卡`);
+}
+
+async function generateFromPaste() {
+  const text = document.querySelector("#paste-text")?.value.trim() || "";
+  if (text.length < 30) {
+    toast("资料太短了，至少粘贴一小段完整笔记");
+    return;
+  }
+  await withBusy(desktop ? "正在调用本地模型生成题卡..." : "正在生成题卡...", async () => {
+    const title = guessTitle(text);
+    const set = await buildStudySet(title, text, "粘贴资料");
+    state.sets = [set, ...state.sets];
+    state.drawerOpen = true;
+    state.drawerTab = "questions";
+    state.currentReviewId = dueItems(state)[0]?.id || set.items[0]?.id;
+    saveState();
+    render();
+    toast(`已生成 ${set.items.length} 道题和 ${set.cards.length} 张闪卡`);
+  });
+}
+
+async function buildStudySet(title, text, sourceName) {
+  if (!desktop) return createStudySet(title, text, sourceName);
+  try {
+    const generated = await desktop.generateStudySet({ title, text, settings: state.settings });
+    return createStudySetFromAi(generated, text, sourceName);
+  } catch (error) {
+    toast(`本地模型不可用，已用离线规则生成：${error.message}`);
+    return createStudySet(title, text, sourceName);
+  }
+}
+
+async function checkServices() {
+  if (!desktop) {
+    toast("请在桌面版中检测服务");
+    return;
+  }
+  await withBusy("正在检测本地服务...", async () => {
+    state.serviceStatus = await desktop.checkServices({ settings: state.settings });
+    saveState();
+    render();
+  });
+}
+
+async function withBusy(message, task) {
+  state.busy = message;
+  render();
+  try {
+    await task();
+  } catch (error) {
+    toast(error.message || "操作失败");
+  } finally {
+    state.busy = "";
+    saveState();
+    render();
+  }
 }
 
 function gradeCurrent(grade) {
   const currentId = state.currentReviewId || dueItems()[0]?.id;
   if (!currentId) return;
-  let nextId = null;
   state.sets = state.sets.map((set) => {
     const updateItem = (item) => {
       if (item.id !== currentId) return item;
@@ -900,18 +945,10 @@ function gradeCurrent(grade) {
         difficulty: grade === 1 ? "困难" : grade === 2 ? "中等" : "简单",
       };
     };
-    return {
-      ...set,
-      items: set.items.map(updateItem),
-      cards: set.cards.map(updateItem),
-    };
+    return { ...set, items: set.items.map(updateItem), cards: set.cards.map(updateItem) };
   });
-  state.reviewLog = [
-    ...state.reviewLog,
-    { id: uid("log"), itemId: currentId, grade, at: new Date().toISOString() },
-  ];
-  nextId = dueItems(state).find((item) => item.id !== currentId)?.id || allItems(state).find((item) => item.id !== currentId)?.id;
-  state.currentReviewId = nextId || null;
+  state.reviewLog = [...state.reviewLog, { id: uid("log"), itemId: currentId, grade, at: new Date().toISOString() }];
+  state.currentReviewId = dueItems(state).find((item) => item.id !== currentId)?.id || allItems(state).find((item) => item.id !== currentId)?.id || null;
   state.revealAnswer = false;
   saveState();
   render();
@@ -935,7 +972,7 @@ function toast(message) {
   node.textContent = message;
   node.classList.add("show");
   window.clearTimeout(toast.timer);
-  toast.timer = window.setTimeout(() => node.classList.remove("show"), 1800);
+  toast.timer = window.setTimeout(() => node.classList.remove("show"), 2400);
 }
 
 render();
